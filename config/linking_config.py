@@ -147,7 +147,7 @@ class LinkingConfig:
     fuzzy_limit: int = 10
     max_query_forms: int = 8
     max_candidates: int = 80
-    max_stored_candidates: int = 30
+    max_stored_candidates: int = 50
     rrf_k: int = 60
     channel_weight: dict = field(default_factory=lambda: {
         "wb": 1.0, "cirrus": 1.0, "fuzzy": 0.5})

@@ -160,7 +160,7 @@ def derive_local_context(context: str, mention_text: str) -> tuple[str, str]:
 # ----------------------------------------------------------------- type normalization
 
 _TYPE_MAP = {
-    "person": "PERSON", "per": "PERSON",
+    "person": "PERSON", "per": "PERSON", "Per": "PERSON",
     "organization": "ORGANIZATION", "org": "ORGANIZATION",
     "place": "PLACE", "loc": "PLACE", "location": "PLACE",
     "event": "EVENT",

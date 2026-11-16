@@ -30,15 +30,15 @@ from config.cls_config import ClusteringConfig
 def main():
     ap = argparse.ArgumentParser(description="Cluster entity mentions from IE output.")
     ap.add_argument("--ie", 
-                    default="data/ner_re.jsonl",
+                    default="data/inputs/full_data/ner_re.jsonl",
                     # required=True, 
                     help="Path to IE JSONL (entities + relations).")
     ap.add_argument("--ocr", 
-                    default="data/processed_annotations_v2_with_qid_cleaned.jsonl", 
+                    default="data/inputs/full_data/bulletins_processed.jsonl", 
                     help="Path to OCR text JSONL (optional).")
     ap.add_argument("--output", default="data/interim", help="Output directory.")
     ap.add_argument("--threshold", type=float, default=0.85, help="Stage-1 similarity threshold.")
-    ap.add_argument("--corpus-threshold", type=float, default=None, help="Stage-2 threshold (default: --threshold).")
+    ap.add_argument("--corpus-threshold", type=float, default=0.9, help="Stage-2 threshold (default: --threshold).")
     ap.add_argument("--cue-window", type=int, default=5, help="Token window for cue extraction.")
     ap.add_argument("--no-flexible", action="store_true", help="Strict cue scan (break at content words).")
     ap.add_argument("--no-nat-strict", action="store_true", help="Allow nationality past content words.")

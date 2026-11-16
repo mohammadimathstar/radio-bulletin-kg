@@ -341,9 +341,9 @@ def clean(s: str) -> str:
 
 
 def doc_date(doc_id: str) -> date:
-    """Parse the bulletin date from an id like 'anp:anp:1939:07:22:6:mpeg21'."""
+    """Parse the bulletin date from an id like 'anp:1939:07:22:6:mpeg21'."""
     p = doc_id.split(":")
-    return date(int(p[2]), int(p[3]), int(p[4]))
+    return date(int(p[-5]), int(p[-4]), int(p[-3]))
 
 
 class Cache:
@@ -1195,7 +1195,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", dest="out_path", default=OUT_PATH, help=f"output wikidata_links.jsonl (default {OUT_PATH})")
     ap.add_argument("--limit", type=int, default=None, help="only the N clusters with most mentions")
     ap.add_argument("--restart", action="store_true", help="delete existing pass-1 file and start over")
-    ap.add_argument("--max-candidates", type=int, default=None, help=f"default {MAX_CANDIDATES}")
+    ap.add_argument("--max-candidates", type=int, default=MAX_CANDIDATES, help=f"default {MAX_CANDIDATES}")
     ap.add_argument("--stored-candidates", type=int, default=None, help=f"default {MAX_STORED_CANDIDATES}")
     ap.add_argument("--search-limit", type=int, default=None, help=f"default {SEARCH_LIMIT} (max 50)")
     ap.add_argument("--cirrus-limit", type=int, default=None, help=f"default {CIRRUS_LIMIT} (max 50)")

@@ -75,7 +75,7 @@ class ClusteringConfig:
     containment_types: tuple = ("PERSON",)
     corpus_threshold: float | None = None
 
-    cue_window: int = 8
+    cue_window: int = 5
     flexible: bool = True
     nationality_strict: bool = True
 
