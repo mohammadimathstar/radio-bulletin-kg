@@ -6,7 +6,7 @@ dist/
 wheels/
 *.egg-info
 
-
+archive
 data
 
 # Virtual environments

@@ -1,32 +1,28 @@
-"""
-Person cues: titles, roles, occupations and nationality next to a person's name
+"""Person cues: titles, roles, occupations and nationality next to a person's name
 in Dutch 1939 news text.
 
-Two improvements over the original person_cues.py:
+The scanner collects cues within a configurable token window (``cue_window``,
+default 8).  Filler particles (van, de, der, ...) are always skipped.  In
+flexible mode (default) non-cue content words are also skipped, so
+``"minister van Onderwijs Prof. VAN MOERKERKEN"`` yields both ``minister`` and
+``prof``.  In strict mode (``flexible=False``) a content word breaks the scan.
 
-1. WINDOW-BASED EXTRACTION.  Instead of requiring cues to be in a contiguous run
-   immediately adjacent to the name, the scanner collects cues within a configurable
-   token window (``cue_window``, default 8).  Filler particles (van, de, der, ...) are
-   always skipped.  In flexible mode (default) non-cue content words are also skipped,
-   so ``"minister van Onderwijs Prof. VAN MOERKERKEN"`` yields both ``minister`` and
-   ``prof``.  In strict mode (``flexible=False``) a content word breaks the scan.
+Nationality has an independent guard: ``nationality_strict`` (default True)
+rejects a nationality adjective found *beyond* a content word, so
+``"Fransche regeering. Generaal SMITH"`` does not attach ``French`` to Smith
+even in flexible mode.  Set ``nationality_strict=False`` to allow it.
 
-   Nationality has an independent guard: ``nationality_strict`` (default True) rejects a
-   nationality adjective found *beyond* a content word, so ``"Fransche regeering.
-   Generaal SMITH"`` does not attach ``French`` to Smith even in flexible mode.  Set
-   ``nationality_strict=False`` to allow it.
+A broad ``OCCUPATIONS`` table covers sports (wielrenner, voetballer, schaker
+...), arts (schilder, beeldhouwer ...), science, trade and more, mapped to
+English labels.  Occupations are carried as METADATA ONLY (cluster
+``occupation_counts``, useful for the later Wikidata linking stage); they are
+deliberately NOT used as a clustering constraint, and the IE ``subtype`` fields
+are never consulted for entity resolution.
 
-2. OCCUPATION DICTIONARY.  A broad ``OCCUPATIONS`` table covers sports (wielrenner,
-   voetballer, schaker ...), arts (schilder, beeldhouwer ...), science, trade and more,
-   mapped to English labels for Wikidata search queries.  Occupations appear in a new
-   ``occupation`` field alongside ``title`` and ``role``.
+Additionally, ``cues_from_mention(text)`` extracts a nationality from demonyms
+embedded IN the mention span (``"den Bel HENDRICKX"`` -> ``belgian``).
 
-Additionally, ``cues_from_mention(text)`` extracts a nationality from demonyms embedded
-IN the mention span (``"den Bel HENDRICKX"`` -> ``belgian``), and
-``occupation_from_subtype(subtype)`` maps the IE system's subtype (``Athlete``) to an
-occupation cue.
-
-    from radio_bulletins_kg.clustering.cues import mention_cues
+    from entity_resolution.cues import mention_cues
     mention_cues("de britsche ambassadeur", ", die vandaag")
     # {"nationality": "british", "title": [], "role": ["ambassadeur"], "occupation": []}
 
@@ -101,8 +97,8 @@ _FUZZY_TITLE_KEYS = [k for k in TITLES if len(k) >= 6 and " " not in k]
 
 
 # ------------------------------------------------------------------ occupations
-# Dutch occupation term -> English label (for Wikidata search queries).
-# QID mapping is done in the linking stage's type_mapping, not here.
+# Dutch occupation term -> English label (for Wikidata search queries and the
+# cluster metadata).  METADATA ONLY: never used as a resolution constraint.
 OCCUPATIONS: dict[str, str] = {
     # --- sports ---
     "wielrenner": "cyclist",
@@ -167,14 +163,6 @@ OCCUPATIONS: dict[str, str] = {
     "piloot": "pilot",
 }
 _FUZZY_OCC_KEYS = [k for k in OCCUPATIONS if len(k) >= 6]
-
-
-# IE subtype -> occupation key (for cues derived from the IE classifier, not from text).
-SUBTYPE_TO_OCCUPATION: dict[str, str] = {
-    "Athlete": "atleet",
-    "Journalist": "journalist",
-    "Businessperson": "ondernemer",
-}
 
 # Nationality demonyms that can appear inside the mention span
 # ("den Bel HENDRICKX" -> belgian, "den Franschman CALLIEN" -> french).
@@ -494,10 +482,3 @@ def cues_from_mention(text: str) -> str | None:
         if n:
             return n
     return None
-
-
-def occupation_from_subtype(subtype: str) -> str | None:
-    """Map an IE subtype (``Athlete``) to an occupation key, or None."""
-    if not subtype:
-        return None
-    return SUBTYPE_TO_OCCUPATION.get(subtype)

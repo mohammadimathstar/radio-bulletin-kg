@@ -1,23 +1,31 @@
-"""
-Two-stage entity resolution: within-document clustering, then corpus-wide.
+"""Two-stage entity resolution with per-type strategies.
 
+Every mention's type is standardized to a canonical capitalized form (``"Person"``,
+``"Place"``, ``"LegalDocument"``, ``"Event"``, ``"Vehicle"`` — see
+:mod:`.entity_types`).  Which type is resolved HOW is decided by
+``ClusteringConfig.strategy_by_type``; the IE ``subtype`` fields are never used.
+
+STRATEGY_STRING_SIMILARITY (default: Person, Place, LegalDocument, Vehicle)
+---------------------------------------------------------------------------
 Type scope
 ----------
-Only the types in ``ClusteringConfig.clustered_types`` (default PERSON, PLACE,
-ORGANIZATION) go through both stages.  EVENT mentions are grouped by ``event_id``
-*within one document* (same event_id -> one cluster; different event_id or no
-event_id -> separate clusters) and are NEVER merged across documents.  Every
-other type becomes a singleton cluster (one mention per cluster) and is also
-kept document-local.  See :func:`cluster_document` and :func:`resolve_entities`.
+Only the types mapped to this strategy go through both stages.  Every type with
+no strategy becomes a singleton cluster (one mention per cluster) and is kept
+document-local.
 
-Stage 1 — within one document (``cluster_document``)
+Stage 1 — within one bulletin (``cluster_document``)
 ----------------------------------------------------
 Inside one document two different entities with similar names are rare, so matching
-is generous:
+is deliberately RELAXED:
 
-  A. **Typo level**: fuzzy ratio + average linkage, with cannot-link guards for
-     numbers / Roman numerals and (for PERSON) nationality.  Identical names with
-     different known nationalities are never merged.
+  A. **Typo level**: average linkage on the plain character-level similarity
+     (``fuzz.ratio``) — the original behaviour.  With ``cfg.stage1_token_guard``
+     the strict token-aware :func:`name_similarity` of stage 2 is applied here
+     too (protects against same-bulletin false merges through shared generic
+     tails; such a stage-1 merge could never be undone at stage 2).
+     Cannot-link guards for numbers / Roman numerals and (for PERSON)
+     nationality always apply; identical names with different known
+     nationalities are never merged.
   B. **Containment** (``attach_contained``): a cluster whose name is contained in the
      name of exactly ONE other cluster of the same document is merged into it,
      tolerating typos and initials ("Chamberlain" -> "Neville Chamberlain",
@@ -25,20 +33,28 @@ is generous:
      hosts) is left unmerged.
 
 The representative of a document cluster is the LONGEST surface form (ties: most
-frequent, alphabetical).  PERSON cues (nationality, title, role, occupation) are
-aggregated per cluster and written to every mention; ``cues_local`` keeps the
+frequent, alphabetical).  PERSON text cues (nationality, title, role, occupation)
+are aggregated per cluster and written to every mention; ``cues_local`` keeps the
 mention's own evidence.
+
+Guarantee: every mention of a string-similarity type lands in exactly one cluster.
+Mentions whose normalized name is empty (e.g. a name consisting only of stripped
+titles) become singleton clusters and are logged under the
+``empty_name_singletons`` diagnostic — they are never silently dropped, and they
+stay document-local: they are never cross-bulletin merged in stage 2.
 
 Stage 2 — over the whole corpus (``cluster_corpus``)
 ----------------------------------------------------
 Each document cluster is a node with ALL its normalised forms as elements.  The
-similarity of two nodes is the CLOSEST pair of elements (max fuzzy ratio).
+similarity of two nodes is the CLOSEST pair of elements, scored by the token-aware
+:func:`name_similarity` (not plain character similarity: names that would only
+merge through a shared generic tail such as ``"... communistische partij"`` are
+vetoed by the token guard and logged under ``token_guard_blocks``).
 Closest-pair (single) linkage chains easily, so merging is constrained:
 
-  - **cannot-link**: PERSON nodes with different known nationalities (and optionally
-    different top occupations when ``occupation_constraint``); nodes with different
-    numbers or Roman numerals; PERSON nodes whose full names conflict (same surname,
-    different given name).
+  - **cannot-link**: PERSON nodes with different known nationalities; nodes with
+    different numbers or Roman numerals; PERSON nodes whose full names conflict
+    (same surname, different given name).
   - **ambiguity**: a node linked to two nodes that cannot be linked to each other is
     not merged with either; it can still merge with equally underspecified nodes.
   - merging goes from strongest link to weakest; two groups merge only if no
@@ -47,13 +63,23 @@ Closest-pair (single) linkage chains easily, so merging is constrained:
 Identical nodes (same forms, same nationality) are collapsed first, so a name in
 thousands of documents does not create millions of links.
 
+STRATEGY_EXACT_EVENT_ID (default: Event)
+----------------------------------------
+Event mentions are grouped by exact ``event_id`` *within one bulletin* (an
+``entity_id`` field is accepted as a fallback name):
+
+  - same non-empty id -> one cluster; different ids -> separate clusters;
+    missing id -> singleton cluster;
+  - stage 2 NEVER merges events across bulletins — each event cluster becomes
+    its own corpus cluster keyed by bulletin and id.
+
 Output
 ------
 ``resolve_entities`` returns ``(doc_clusters, global_resolved)``:
 
   - ``doc_clusters`` — ``{doc_id: [document cluster dicts]}``; each cluster carries
     ``representative``, ``elements``, ``nationality``, ``occupation``, cue counts,
-    ``mentions`` and ``global_cluster`` (the stage-2 cluster id).
+    ``mentions``, ``event_id`` (Event) and ``global_cluster`` (the corpus cluster id).
   - ``global_resolved`` — ``{key: {type: body}}``; each body has ``representative``,
     ``n_mentions``, ``n_documents``, ``surface_forms``, ``doc_representatives``,
     nationality / title / role / occupation counts (PERSON) and ``documents``.
@@ -64,10 +90,12 @@ from functools import lru_cache
 
 import numpy as np
 from rapidfuzz import fuzz, process
+from rapidfuzz.distance import JaroWinkler
 from sklearn.cluster import AgglomerativeClustering
 
+from .config import ClusteringConfig, STRATEGY_EXACT_EVENT_ID  # noqa: F401
 from .normalize import normalize_name, norm_ws
-from config.cls_config import ClusteringConfig
+from .entity_types import canonical_type
 
 # ----------------------------------------------------------------- diagnostics
 
@@ -77,9 +105,9 @@ DIAG: dict = {}
 def reset_diagnostics() -> None:
     DIAG.clear()
     DIAG.update(
-        nationality_splits=[], doc_nationality_conflicts=[], surname_merges=[],
+        nationality_splits=[], doc_nationality_conflicts=[], empty_name_singletons=[],
         containment_merges=[], ambiguous_containment=[], ambiguous_links_dropped=[],
-        blocked_merges=[],
+        blocked_merges=[], token_guard_blocks=[],
     )
 
 
@@ -105,7 +133,8 @@ def choose_longest(counter: Counter) -> str:
 
 # ----------------------------------------------------------------- identity helpers
 
-ROMAN = {"ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii"}
+ROMAN = {"ii", "iii", "iv", "vi", "vii", "viii", "ix", "xi", "xii",
+         "xiii", "xiv", "xv", "xvi", "xvii", "xviii", "xix", "xx"}
 
 
 def number_key(name: str) -> frozenset:
@@ -124,12 +153,13 @@ def top_unique(counter: Counter):
 # ----------------------------------------------------------------- cue accessors
 
 def mention_nat(m: dict):
+    """Text-extracted nationality of a mention (from ``cues_local``), or None."""
     return (m.get("cues_local") or {}).get("nationality")
 
 
-def mention_occ(m: dict):
-    occs = (m.get("cues_local") or {}).get("occupation") or []
-    return occs[0] if occs else None
+def mention_event_id(m: dict):
+    """Event id of a mention: ``event_id`` first, ``entity_id`` as fallback."""
+    return m.get("event_id") or m.get("entity_id")
 
 
 def unit_nationality(items: list, nat_of, weight_of=None):
@@ -142,25 +172,112 @@ def unit_nationality(items: list, nat_of, weight_of=None):
     return top_unique(cnt)
 
 
-def unit_occupation(items: list, occ_of, weight_of=None):
-    """Weighted most frequent occupation of a group (None if unknown or tied)."""
-    cnt = Counter()
-    for it in items:
-        occ = occ_of(it)
-        if occ:
-            cnt[occ] += weight_of(it) if weight_of else 1
-    return top_unique(cnt)
+# ----------------------------------------------------------------- token-aware similarity
+#
+# Why not plain fuzz.ratio?  Character-level similarity overrates multi-word names
+# that share a long generic tail.  Real corpus case (both Organization, threshold
+# 0.9, merged by plain fuzz.ratio at 0.918):
+#
+#     fuzz.ratio("fransche communistische partij",
+#                "spaansche communistische partij")  =  0.918
+#
+# although the two parties are obviously different — 24 of the 30 characters (the
+# whole tail " communistische partij" plus the shared "ansche") match.  What
+# distinguishes the names is the token that changed.  :func:`name_similarity`
+# therefore takes the MINIMUM of two views:
+#
+#   * full-string ``fuzz.ratio`` — tolerant to typos spread over the name;
+#   * worst per-token Jaro-Winkler — every token of the shorter name must find a
+#     similar partner token in the longer name.  Jaro-Winkler rewards the shared
+#     PREFIX of historical spelling variants ("fransche"/"franse" -> 0.95) and
+#     stays low for different words ("fransche"/"spaansche" -> 0.81).
+#
+# Because it is a minimum, the score can only be LOWER than fuzz.ratio: it vetoes
+# merges, it never creates them.  Names whose tokens concatenate to the same string
+# ("chamber lain" / "chamberlain": an OCR word split in two) count as identical.
+#
+# The two levels use it differently: stage 2 ALWAYS scores edges with
+# :func:`name_similarity`; stage 1 uses the relaxed plain fuzz.ratio unless
+# ``cfg.stage1_token_guard`` is set (inside one bulletin two different entities
+# with similar names are rare, and a stage-1 merge cannot be undone at stage 2).
+
+GUARD_WINDOW = 0.15   # re-score candidate pairs within this margin below the threshold
+
+
+@lru_cache(maxsize=65536)
+def _token_sim(a: str, b: str) -> float:
+    """Cached Jaro-Winkler similarity of two tokens (0..1)."""
+    return float(JaroWinkler.similarity(a, b))
+
+
+@lru_cache(maxsize=65536)
+def min_token_similarity(a: str, b: str) -> float:
+    """Worst per-token Jaro-Winkler similarity of two names (0..1).
+
+    For every (multi-character) token of the shorter name the BEST match among
+    the longer name's tokens is taken; the minimum over those is returned.
+    A low value means "at least one token has no counterpart in the other name"
+    — the signature of two different entities sharing only generic words.
+    Single-character tokens are wildcards (initials are matched by containment
+    and ``name_compat``, not here).
+    """
+    ta, tb = a.split(), b.split()
+    if not ta or not tb:
+        return 0.0
+    shorter, longer = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    scores = [max(_token_sim(t, u) for u in longer) for t in shorter if len(t) > 1]
+    return min(scores) if scores else 1.0
+
+
+@lru_cache(maxsize=262144)
+def name_similarity(a: str, b: str) -> float:
+    """Token-aware similarity of two normalised names (0..1) — the merge score.
+
+    ``min(fuzz.ratio of the full strings, worst per-token Jaro-Winkler)``, with an
+    exact-despace shortcut for OCR words split in two.  Examples:
+
+        ("fransche communistische partij", "spaansche ...")  ->  0.81  vetoed
+        ("fransche communistische partij", "franse ...")     ->  0.95  merges
+        ("chamber lain", "chamberlain")                      ->  1.00  OCR split
+    """
+    if a == b:
+        return 1.0
+    if a.replace(" ", "") == b.replace(" ", ""):
+        return 1.0
+    return min(fuzz.ratio(a, b) / 100.0, min_token_similarity(a, b))
 
 
 # ----------------------------------------------------------------- distance matrix + stage-1 clustering
 
-def distance_matrix(names: list[str], nat_ids, num_ids, occ_ids=None) -> np.ndarray:
-    """1 - fuzzy similarity, forced to 1.0 for pairs that must not be merged."""
-    dist = 1.0 - process.cdist(names, names, scorer=fuzz.ratio, dtype=np.float32, workers=-1) / 100.0
+def distance_matrix(names: list[str], nat_ids, num_ids, thr: float,
+                    guard: bool = True) -> np.ndarray:
+    """1 - similarity, forced to 1.0 for pairs that must not be merged.
+
+    The full fuzz.ratio matrix is computed with the fast C implementation.  With
+    ``guard=True`` (stage 2, or stage 1 with ``stage1_token_guard``) candidate
+    pairs (fuzz ratio within ``GUARD_WINDOW`` below ``thr``) are re-scored with
+    the (slower, cached) :func:`name_similarity`, which can only LOWER the
+    similarity — pairs outside that window keep their fuzz score, which is then
+    an optimistic lower bound that could never reach the merge threshold anyway.
+    Guard vetoes of otherwise-merging pairs are logged under ``token_guard_blocks``.
+    With ``guard=False`` (default stage 1) the plain fuzz.ratio distances are kept.
+    """
+    fuzz_sim = process.cdist(names, names, scorer=fuzz.ratio, dtype=np.float32, workers=-1) / 100.0
+    dist = 1.0 - fuzz_sim
+    if guard:
+        lo = max(thr - GUARD_WINDOW, 0.0)
+        for i, j in np.argwhere(fuzz_sim >= lo):
+            if j <= i:
+                continue
+            s = name_similarity(names[i], names[j])
+            if s < float(fuzz_sim[i, j]):
+                dist[i, j] = dist[j, i] = 1.0 - s
+                if fuzz_sim[i, j] >= thr and s < thr:
+                    _log("token_guard_blocks",
+                         dict(a=names[i], b=names[j], fuzz=round(float(fuzz_sim[i, j]), 3),
+                              score=round(s, 3), stage=1))
     if nat_ids is not None:
         dist[(nat_ids[:, None] != nat_ids[None, :]) & (nat_ids[:, None] > 0) & (nat_ids[None, :] > 0)] = 1.0
-    if occ_ids is not None:
-        dist[(occ_ids[:, None] != occ_ids[None, :]) & (occ_ids[:, None] > 0) & (occ_ids[None, :] > 0)] = 1.0
     dist[(num_ids[:, None] != num_ids[None, :]) & (num_ids[:, None] > 0) & (num_ids[None, :] > 0)] = 1.0
     np.fill_diagonal(dist, 0.0)
     return dist
@@ -219,20 +336,22 @@ def repair_nationality(labels, nats: list, dist: np.ndarray, thr: float, names: 
 
 
 def cluster_units(names: list[str], nats: list, thr: float, use_nat: bool,
-                  occs: list | None = None, use_occ: bool = False) -> list[int]:
-    """Cluster normalised unique names; returns one label per name."""
+                  guard: bool = True) -> list[int]:
+    """Cluster normalised unique names; returns one label per name.
+
+    ``guard=False`` uses the relaxed plain fuzz.ratio (default stage 1);
+    ``guard=True`` applies the token-aware merge score (stage 2, or opt-in).
+    """
     n = len(names)
     if n == 1:
         return [0]
     nat_vals = {v: i + 1 for i, v in enumerate(sorted({x for x in nats if x}))}
     nat_ids = np.array([nat_vals.get(x, 0) for x in nats]) if use_nat else None
-    occ_vals = {v: i + 1 for i, v in enumerate(sorted({x for x in (occs or []) if x}))}
-    occ_ids = np.array([occ_vals.get(x, 0) for x in (occs or [])]) if (use_occ and occs) else None
     keys, num_ids = {}, []
     for s in names:
         k = number_key(s)
         num_ids.append(keys.setdefault(k, len(keys) + 1) if k else 0)
-    dist = distance_matrix(names, nat_ids, np.array(num_ids), occ_ids)
+    dist = distance_matrix(names, nat_ids, np.array(num_ids), thr, guard)
     labels = AgglomerativeClustering(n_clusters=None, metric="precomputed", linkage="average",
                                      distance_threshold=1.0 - thr).fit_predict(dist)
     if use_nat:
@@ -240,12 +359,19 @@ def cluster_units(names: list[str], nats: list, thr: float, use_nat: bool,
     return [int(x) for x in labels]
 
 
-def entity_disambiguation(items: list, thr: float, nat_of=None, use_nat: bool = True,
-                          occ_of=None, use_occ: bool = False, field: str = "text") -> list[dict]:
-    """Cluster items (mentions or document clusters) independently PER TYPE.
+def entity_disambiguation(items: list, thr: float, thr_of=None, nat_of=None,
+                          use_nat: bool = True, field: str = "text",
+                          guard: bool = True) -> list[dict]:
+    """Cluster items (mentions) independently PER TYPE (string-similarity strategy).
 
     The clustering unit is (normalised name, nationality) for PERSON: identical names
     with different known nationalities are separate units that are never merged.
+    ``thr_of(etype)`` overrides the threshold per type when given.  ``guard=False``
+    clusters on the relaxed plain fuzz.ratio (default stage 1); ``guard=True`` on
+    the token-aware score.
+
+    Every item lands in exactly one returned cluster: items whose normalized name is
+    empty are wrapped in their own singleton cluster (and logged), never dropped.
     Returns ``[{"type", "norm_names", "members"}]``.
     """
     by_type = defaultdict(list)
@@ -255,34 +381,33 @@ def entity_disambiguation(items: list, thr: float, nat_of=None, use_nat: bool = 
 
     clusters = []
     for etype, group in by_type.items():
-        is_person = etype == "PERSON"
+        is_person = etype == "Person"
         use = use_nat and nat_of is not None and is_person
-        use_o = use_occ and occ_of is not None and is_person
+        t = thr_of(etype) if thr_of else thr
         by_unit = defaultdict(list)
+        empty: list = []
         for it in group:
             nm = normalize_name(it[field])
             if nm:
                 by_unit[(nm, nat_of(it) if use else None)].append(it)
+            else:
+                empty.append(it)
         units = sorted(by_unit, key=lambda u: (u[0], u[1] or ""))
-        if not units:
-            continue
-        names = [u[0] for u in units]
-        nats = [u[1] for u in units]
-        occs = [occ_of(it) if use_o else None for it in group]  # not per-unit; see below
-        # Build per-unit occupation (top occupation among the unit's members)
-        if use_o:
-            unit_occs = []
-            for u in units:
-                unit_occs.append(unit_occupation(by_unit[u], occ_of))
-        else:
-            unit_occs = [None] * len(units)
-        labels = cluster_units(names, nats, thr, use, unit_occs, use_o)
-        buckets = defaultdict(list)
-        for u, lab in zip(units, labels):
-            buckets[lab].append(u)
-        for us in buckets.values():
-            clusters.append(dict(type=etype, norm_names=sorted({u[0] for u in us}),
-                                 members=[it for u in us for it in by_unit[u]]))
+        if units:
+            names = [u[0] for u in units]
+            nats = [u[1] for u in units]
+            labels = cluster_units(names, nats, t, use, guard)
+            buckets = defaultdict(list)
+            for u, lab in zip(units, labels):
+                buckets[lab].append(u)
+            for us in buckets.values():
+                clusters.append(dict(type=etype, norm_names=sorted({u[0] for u in us}),
+                                     members=[it for u in us for it in by_unit[u]]))
+        if empty:
+            # no-silent-drop guarantee: unwrapped mentions stay in the output
+            clusters.append(dict(type=etype, norm_names=[], members=empty))
+            _log("empty_name_singletons", dict(type=etype, count=len(empty),
+                                               examples=[e.get("text", "")[:40] for e in empty[:5]]))
     return clusters
 
 
@@ -293,12 +418,17 @@ PARTICLES = {"van", "de", "der", "den", "von", "di", "du", "le", "la", "el", "al
 
 
 def tokens_match(a: str, b: str, thr: float) -> bool:
-    """Equal tokens, an initial vs a name starting with it, or fuzzy equal tokens."""
+    """Equal tokens, an initial vs a name starting with it, or fuzzy equal tokens.
+
+    Fuzzy equality uses Jaro-Winkler, which rewards a shared prefix: historical
+    spelling variants ("fransche"/"franse", "chamberlain"/"chamberlin") match,
+    different words that merely share a suffix do not.
+    """
     if a == b:
         return True
     if len(a) == 1 or len(b) == 1:
         return a.startswith(b) or b.startswith(a)
-    return fuzz.ratio(a, b) >= thr * 100
+    return _token_sim(a, b) >= thr
 
 
 def contained(short: str, long: str, thr: float, anchor_last: bool = True) -> bool:
@@ -329,7 +459,17 @@ def contained(short: str, long: str, thr: float, anchor_last: bool = True) -> bo
 
 
 def name_compat(a: str, b: str, thr: float) -> bool:
-    """Can two multi-token PERSON names be the same person? Same surname and compatible first names."""
+    """Can two multi-token PERSON names be the same person? Same surname and compatible first names.
+
+    Shares :func:`name_similarity`'s despace identity: OCR breaks a surname
+    across a line ("VON RIBBEN- TROP" / "VON RIBBENTROP"), so the token sequences
+    disagree while the concatenated characters are identical.  Without this
+    shortcut the cannot-link below vetoes the very edges that
+    :func:`name_similarity` scores 1.0, and the ambiguity-drop pass then severs
+    every link at such clusters — a hard corpus-wide split of one person.
+    """
+    if a.replace(" ", "") == b.replace(" ", ""):
+        return True
     ta, tb = a.split(), b.split()
     if not tokens_match(ta[-1], tb[-1], thr):
         return False
@@ -339,17 +479,23 @@ def name_compat(a: str, b: str, thr: float) -> bool:
 
 
 def attach_contained(clusters: list[dict], cfg: ClusteringConfig, doc_id: str = "") -> list[dict]:
-    """Merge a cluster into the ONE cluster of the same document that contains its name."""
+    """Merge a cluster into the ONE cluster of the same document that contains its name.
+
+    Only types listed in ``cfg.containment_types`` participate; matching uses the
+    stage-1 threshold ``cfg.threshold``.
+    """
     types = set(cfg.containment_types)
     while True:
         cand = sorted((c for c in clusters if c["type"] in types),
-                      key=lambda c: (max(len(n.split()) for n in c["norm_names"]), c["norm_names"]))
+                      key=lambda c: (max(len(n.split()) for n in c["norm_names"] or [""]), c["norm_names"]))
         merged = False
         for s in cand:
-            anchor = s["type"] == "PERSON"
+            if not s["norm_names"]:
+                continue
+            anchor = s["type"] == "Person"
             hosts = []
             for c in clusters:
-                if c is s or c["type"] != s["type"]:
+                if c is s or c["type"] != s["type"] or not c["norm_names"]:
                     continue
                 if not any(contained(sn, cn, cfg.threshold, anchor)
                            for sn in s["norm_names"] for cn in c["norm_names"]):
@@ -377,18 +523,20 @@ def attach_contained(clusters: list[dict], cfg: ClusteringConfig, doc_id: str = 
 # ----------------------------------------------------------------- events + singletons (stage 1)
 
 def cluster_events_by_id(events: list) -> list[dict]:
-    """Group EVENT mentions by ``event_id`` *within one document*.
+    """Group EVENT mentions by exact ``event_id`` *within one bulletin*.
 
-    - Events with the same non-empty ``event_id`` -> one cluster.
-    - Events with different ``event_id`` -> separate clusters.
-    - Events without ``event_id`` -> each its own singleton cluster.
+    ``event_id`` is read first, ``entity_id`` is accepted as a fallback field name.
 
-    No cross-document merging is ever performed for events (stage 2 skips them).
+    - Events with the same non-empty id -> one cluster.
+    - Events with different ids -> separate clusters.
+    - Events without an id -> each its own singleton cluster.
+
+    No cross-bulletin merging is ever performed for events (stage 2 skips them).
     """
     by_eid: dict = defaultdict(list)
     no_eid: list = []
     for e in events:
-        eid = e.get("event_id")
+        eid = mention_event_id(e)
         if eid:
             by_eid[eid].append(e)
         else:
@@ -398,11 +546,11 @@ def cluster_events_by_id(events: list) -> list[dict]:
     for eid, members in by_eid.items():
         norm_names = sorted({normalize_name(m.get("text", "")) for m in members
                              if m.get("text")})
-        out.append(dict(type="EVENT", members=members, norm_names=norm_names,
+        out.append(dict(type="Event", members=members, norm_names=norm_names,
                         event_id=eid))
     for e in no_eid:
         nm = normalize_name(e.get("text", ""))
-        out.append(dict(type="EVENT", members=[e],
+        out.append(dict(type="Event", members=[e],
                         norm_names=[nm] if nm else [], event_id=None))
     return out
 
@@ -410,39 +558,42 @@ def cluster_events_by_id(events: list) -> list[dict]:
 def make_singleton_cluster(entity: dict) -> dict:
     """Wrap a single mention as its own cluster (no merging, stage 1 + stage 2)."""
     nm = normalize_name(entity.get("text", ""))
-    return dict(type=(entity.get("type") or "").upper() or "UNKNOWN",
+    return dict(type=canonical_type(entity.get("type")) or "Unknown",
                 members=[entity], norm_names=[nm] if nm else [])
 
 
 # ----------------------------------------------------------------- stage 1 entry point
 
 def cluster_document(entities: list[dict], cfg: ClusteringConfig, doc_id: str = "") -> list[dict]:
-    """Stage 1: within-document clustering for ALL entity types.
+    """Stage 1: within-bulletin clustering for ALL entity types.
 
-    - ``cfg.clustered_types`` (PERSON/PLACE/ORGANIZATION): typo-level fuzzy
+    Types are canonicalized defensively here as well, so the function behaves
+    correctly even without the context stage.  Dispatch by strategy:
+
+    - string-similarity types (``cfg.string_similarity_types``): typo-level fuzzy
       clustering (:func:`entity_disambiguation`) + containment attachment
       (:func:`attach_contained`).
-    - EVENT: grouped by ``event_id`` within this document via
-      :func:`cluster_events_by_id` (same id -> one cluster; different id or missing
-      id -> separate clusters).  Never merged across documents.
-    - Other types: each mention becomes its own singleton cluster via
+    - Event (``STRATEGY_EXACT_EVENT_ID``): grouped by exact ``event_id`` within this
+      bulletin via :func:`cluster_events_by_id`.
+    - Types with no strategy: each mention becomes its own singleton cluster via
       :func:`make_singleton_cluster`.
     """
-    up = lambda t: (t or "").upper()
-    clustered_set = set(cfg.clustered_types)
+    for e in entities:
+        e["type"] = canonical_type(e.get("type")) or "Unknown"
 
-    clustered = [e for e in entities if up(e.get("type")) in clustered_set]
+    sim = cfg.string_similarity_types
+    clustered = [e for e in entities if e.get("type") in sim]
     clusters = entity_disambiguation(
-        clustered, cfg.threshold,
+        clustered, cfg.threshold, thr_of=cfg.stage1_threshold,
         nat_of=mention_nat, use_nat=cfg.nationality_constraint,
-        occ_of=mention_occ, use_occ=cfg.occupation_constraint)
+        guard=cfg.stage1_token_guard)
     clusters = attach_contained(clusters, cfg, doc_id)
 
-    events = [e for e in entities if up(e.get("type")) == "EVENT"]
+    events = [e for e in entities if e.get("type") == "Event"]
     clusters.extend(cluster_events_by_id(events))
 
-    passthrough = clustered_set | {"EVENT"}
-    others = [e for e in entities if up(e.get("type")) not in passthrough]
+    passthrough = sim | {"Event"}
+    others = [e for e in entities if e.get("type") not in passthrough]
     for e in others:
         clusters.append(make_singleton_cluster(e))
 
@@ -462,15 +613,21 @@ def finalize_doc_cluster(cl: dict, doc_id: str) -> dict:
         title_counts=Counter(), role_counts=Counter(), occupation_counts=Counter(),
         occupation=None,
     )
-    if cl["type"] == "PERSON":
+    if cl["type"] == "Person":
+        def _add_each_once(counter: Counter, cues) -> None:
+            # count each distinct cue once per mention, in reading order —
+            # a set() here would order ties by per-process string hash
+            for cue in dict.fromkeys(cues or []):
+                counter[cue] += 1
+
         nat, ttl, rol, occ = Counter(), Counter(), Counter(), Counter()
         for m in mentions:
             c = m.get("cues_local") or {}
             if c.get("nationality"):
                 nat[c["nationality"]] += 1
-            ttl.update(set(c.get("title", [])))
-            rol.update(set(c.get("role", [])))
-            occ.update(set(c.get("occupation", [])))
+            _add_each_once(ttl, c.get("title"))
+            _add_each_once(rol, c.get("role"))
+            _add_each_once(occ, c.get("occupation"))
         if len(nat) > 1:
             _log("doc_nationality_conflicts", dict(doc=doc_id, name=out["representative"], counts=dict(nat)))
         out.update(
@@ -483,16 +640,20 @@ def finalize_doc_cluster(cl: dict, doc_id: str) -> dict:
             m["title"] = [k for k, _ in ttl.most_common()]
             m["role"] = [k for k, _ in rol.most_common()]
             m["occupation"] = [k for k, _ in occ.most_common()]
-    if cl["type"] == "EVENT":
+    if cl["type"] == "Event":
         out["event_id"] = cl.get("event_id")
     return out
 
 
 # ----------------------------------------------------------------- stage 2: corpus-wide
 
-def cluster_corpus(dcs: list[dict], thr: float, use_nat: bool, person: bool,
-                   use_occ: bool = False) -> list[list[dict]]:
-    """Stage 2 for ONE type: groups of document clusters (see module docstring)."""
+def cluster_corpus(dcs: list[dict], thr: float, use_nat: bool, person: bool) -> list[list[dict]]:
+    """Stage 2 for ONE type: groups of document clusters (see module docstring).
+
+    ``thr`` is the corpus threshold for this type; ``use_nat``/``person`` enable the
+    nationality cannot-link and the full-name compatibility guard respectively
+    (both apply to Person only).
+    """
     sigs = defaultdict(list)
     for dc in dcs:
         key = (tuple(dc["elements"]), dc["nationality"] if use_nat else None)
@@ -509,17 +670,28 @@ def cluster_corpus(dcs: list[dict], thr: float, use_nat: bool, person: bool,
     starts = np.cumsum([0] + [len(el) for el in elems[:-1]])
     node = [dict(
         nat=keys[i][1],
-        occ=top_unique(Counter(
-            dc.get("occupation") or [None] for dc in sigs[keys[i]] if dc.get("occupation")
-        )) if use_occ else None,
         num=frozenset().union(*(number_key(e) for e in elems[i])),
         multi=frozenset(e for e in elems[i] if len(e.split()) >= 2),
     ) for i in range(n)]
 
-    # candidate links: closest pair of elements (no n x n matrix stored)
+    # candidate links: closest pair of elements, token-guarded (no n x n matrix stored).
+    # cells below the fuzz cutoff are 0, so they can never reach the threshold;
+    # candidate cells are re-scored with the token-aware similarity, which can only
+    # lower them — a pair that survives via a shared generic tail is vetoed here.
     edges = []
     for i in range(n):
-        sims = process.cdist(elems[i], uniq, scorer=fuzz.ratio, dtype=np.float32, workers=-1)
+        sims = process.cdist(elems[i], uniq, scorer=fuzz.ratio, dtype=np.float32,
+                             score_cutoff=thr * 100, workers=-1)
+        if not sims.any():
+            continue
+        for x, y in np.argwhere(sims > 0):
+            s = name_similarity(elems[i][x], uniq[y]) * 100.0
+            if s < float(sims[x, y]):
+                if s < thr * 100.0:
+                    _log("token_guard_blocks",
+                         dict(a=elems[i][x], b=uniq[y], fuzz=round(float(sims[x, y]) / 100, 3),
+                              score=round(s / 100, 3), stage=2))
+                sims[x, y] = s
         vec = np.maximum.reduceat(sims.max(axis=0)[order], starts)
         edges += [(float(vec[j]), i, int(j)) for j in np.where(vec >= thr * 100)[0] if j > i]
 
@@ -529,8 +701,6 @@ def cluster_corpus(dcs: list[dict], thr: float, use_nat: bool, person: bool,
 
     def cannot(a: dict, b: dict) -> bool:
         if use_nat and a["nat"] and b["nat"] and a["nat"] != b["nat"]:
-            return True
-        if use_occ and a["occ"] and b["occ"] and a["occ"] != b["occ"]:
             return True
         if a["num"] and b["num"] and a["num"].isdisjoint(b["num"]):
             return True
@@ -557,7 +727,7 @@ def cluster_corpus(dcs: list[dict], thr: float, use_nat: bool, person: bool,
 
     # constrained single-linkage: strongest links first
     parent = list(range(n))
-    comp = [dict(nat=node[i]["nat"], occ=node[i]["occ"], num=set(node[i]["num"]),
+    comp = [dict(nat=node[i]["nat"], num=set(node[i]["num"]),
                  multi=set(node[i]["multi"]), members=[i]) for i in range(n)]
 
     def find(x: int) -> int:
@@ -579,7 +749,6 @@ def cluster_corpus(dcs: list[dict], thr: float, use_nat: bool, person: bool,
         c, d = comp[ri], comp[rj]
         c["members"] += d["members"]
         c["nat"] = c["nat"] or d["nat"]
-        c["occ"] = c["occ"] or d["occ"]
         c["num"] |= d["num"]
         c["multi"] |= d["multi"]
 
@@ -606,7 +775,7 @@ def build_body(group: dict) -> dict:
         surface_forms=dict(forms.most_common()),
         doc_representatives=doc_reps,
     )
-    if group["type"] == "PERSON":
+    if group["type"] == "Person":
         nat, ttl, rol, occ = Counter(), Counter(), Counter(), Counter()
         for dc in dcs:
             if dc["nationality"]:
@@ -644,7 +813,7 @@ def assemble(bodies: list[tuple[str, dict]]) -> dict:
 def build_singleton_body(dc: dict) -> dict:
     """Corpus-level body for a singleton or event doc-cluster.
 
-    These clusters never participate in cross-document merging, so the body just
+    These clusters never participate in cross-bulletin merging, so the body just
     describes the single document cluster (one or more mentions of the same
     ``event_id``, or exactly one mention for other singleton types).
     """
@@ -658,7 +827,7 @@ def build_singleton_body(dc: dict) -> dict:
         doc_representatives={dc["doc_id"]: dc["representative"]},
         documents={dc["doc_id"]: mentions},
     )
-    if dc["type"] == "EVENT":
+    if dc["type"] == "Event":
         body["event_id"] = dc.get("event_id")
     return body
 
@@ -667,13 +836,13 @@ def singleton_global_key(dc: dict, body: dict) -> str:
     """Unique global key for a singleton/event doc-cluster.
 
     Events: ``"{rep} [event:{doc_id}:{event_id or 'nil'}]"``  — the doc_id and
-    event_id make the key unique per document, so two events with the same
-    ``event_id`` in different documents stay separate.
+    event_id make the key unique per bulletin, so two events with the same
+    ``event_id`` in different bulletins stay separate.
 
     Other singletons: ``"{rep} [{doc_id}#{first_start}]"``.
     """
     rep = body["representative"]
-    if dc["type"] == "EVENT":
+    if dc["type"] == "Event":
         eid = dc.get("event_id") or "nil"
         return f"{rep} [event:{dc['doc_id']}:{eid}]"
     first_start = min((m.get("start") or 0) for m in dc["mentions"])
@@ -683,47 +852,53 @@ def singleton_global_key(dc: dict, body: dict) -> str:
 # ----------------------------------------------------------------- orchestration
 
 def resolve_entities(mentions_by_doc: dict, cfg: ClusteringConfig):
-    """Two-stage resolution with type-scoped clustering.
+    """Two-stage resolution with per-type strategies.
 
-    ``cfg.clustered_types`` (PERSON/PLACE/ORGANIZATION) go through both stages.
-    EVENT mentions are grouped by ``event_id`` within their document only and are
-    never merged across documents.  Every other type becomes a singleton cluster
-    (one mention per cluster, also document-local).  All clusters — clustered,
-    event, or singleton — receive a unique ``global_cluster`` key.
+    Types mapped to ``STRATEGY_STRING_SIMILARITY`` (default Person, Place,
+    LegalDocument, Vehicle) go through both clustering stages.  Event mentions
+    (``STRATEGY_EXACT_EVENT_ID``) are grouped by exact ``event_id`` within their
+    bulletin only and are never merged across bulletins.  Types with no strategy
+    become singleton clusters (one mention per cluster, document-local).  All
+    clusters — clustered, event, or singleton — receive a unique ``global_cluster``
+    key.
 
     Returns ``(doc_clusters, global_resolved)``:
       - ``doc_clusters`` — ``{doc_id: [document cluster dicts]}`` (stage 1)
-      - ``global_resolved`` — ``{key: {type: body}}`` (stage 2 for clustered types;
-        one entry per event/singleton doc-cluster otherwise)
+      - ``global_resolved`` — ``{key: {type: body}}`` (stage 2 for string-similarity
+        types; one entry per event/singleton doc-cluster otherwise)
     """
     reset_diagnostics()
 
-    # Stage 1: within-doc clustering for ALL types
+    # Stage 1: within-bulletin clustering for ALL types
     doc_clusters = {}
     for doc_id, entities in mentions_by_doc.items():
         doc_clusters[doc_id] = [finalize_doc_cluster(c, doc_id)
                                 for c in cluster_document(entities, cfg, doc_id)]
 
-    # Partition doc-clusters: clustered types go to stage 2; events + singletons
-    # are kept document-local (each becomes its own global cluster).
+    # Partition doc-clusters: string-similarity types go to stage 2; events and
+    # singletons are kept document-local (each becomes its own global cluster).
+    # Empty-name doc clusters (``empty_name_singletons``: OCR garbage whose text
+    # normalizes to "") must NOT enter ``cluster_corpus`` — they have no elements
+    # to compare, so they would crash the similarity pass and could never be
+    # linked anyway.  They stay document-local singletons.
     by_type: dict = defaultdict(list)
     passthrough_dcs: list = []
     for dcs in doc_clusters.values():
         for dc in dcs:
-            if dc["type"] in cfg.clustered_types:
+            if cfg.strategy_for(dc["type"]) == STRATEGY_EXACT_EVENT_ID:
+                passthrough_dcs.append(dc)
+            elif dc["type"] in cfg.string_similarity_types and dc["elements"]:
                 by_type[dc["type"]].append(dc)
             else:
                 passthrough_dcs.append(dc)
 
-    # Stage 2: corpus-wide for clustered_types only
-    thr = cfg.corpus_threshold if cfg.corpus_threshold is not None else cfg.threshold
+    # Stage 2: corpus-wide for string-similarity types only
     groups = []
     for etype, dcs in by_type.items():
-        person = etype == "PERSON"
+        person = etype == "Person"
         for members in cluster_corpus(
-                dcs, thr,
-                cfg.nationality_constraint and person, person,
-                cfg.occupation_constraint and person):
+                dcs, cfg.stage2_threshold(etype),
+                cfg.nationality_constraint and person, person):
             groups.append(dict(type=etype, members=[dict(dc=dc) for dc in members]))
 
     bodies = [(g["type"], build_body(g), g) for g in groups]
@@ -753,12 +928,21 @@ def resolve_entities(mentions_by_doc: dict, cfg: ClusteringConfig):
 # ----------------------------------------------------------------- per-document output
 
 MENTION_FIRST = ("text", "normalized_text", "raw_text", "start", "end", "type",
-                 "sentence", "context")
+                 "sentence", "context", "paragraph_id")
 
 
 def doc_record(doc_id: str, dcs: list[dict]) -> dict:
-    """JSON-friendly record of one document: its clusters with mentions."""
-    clusters = []
+    """JSON-friendly record of one document: its clusters with mentions.
+
+    ``clusters`` holds only clusters with at least one non-empty normalized
+    name — this is the wikidata-facing field.  Name-less clusters (the stage-1
+    ``empty_name_singletons``, e.g. OCR garbage whose text normalizes to "") are
+    tracked in ``empty_name_clusters`` instead, with the same per-cluster
+    structure: kept for auditing, but never used for wikidata linking.
+    ``n_mentions`` counts both lists; ``n_clusters`` counts ``clusters`` only.
+    """
+    clusters: list = []
+    empty_name: list = []
     for i, dc in enumerate(sorted(dcs, key=lambda d: min(m.get("start") or 0 for m in d["mentions"])), 1):
         mentions = []
         for m in sorted(dc["mentions"], key=lambda m: m.get("start") or 0):
@@ -778,7 +962,7 @@ def doc_record(doc_id: str, dcs: list[dict]) -> dict:
             surface_forms=dict(Counter(norm_ws(m["text"]) for m in dc["mentions"]).most_common()),
             n_mentions=len(mentions), global_cluster=dc.get("global_cluster"),
         )
-        if dc["type"] == "PERSON":
+        if dc["type"] == "Person":
             c.update(
                 nationality=dc["nationality"],
                 nationality_counts=dict(dc["nationality_counts"].most_common()),
@@ -789,15 +973,20 @@ def doc_record(doc_id: str, dcs: list[dict]) -> dict:
                 role_counts=dict(dc["role_counts"].most_common()),
                 occupation_counts=dict(dc["occupation_counts"].most_common()),
             )
-        if dc["type"] == "EVENT":
+        if dc["type"] == "Event":
             c["event_id"] = dc.get("event_id")
         c["mentions"] = mentions
-        clusters.append(c)
+        if dc.get("elements"):
+            clusters.append(c)      # has a normalized name -> wikidata-facing field
+        else:
+            empty_name.append(c)    # name-less -> tracked, excluded from wikidata linking
     return dict(
         doc_id=doc_id,
-        n_mentions=sum(c["n_mentions"] for c in clusters),
+        n_mentions=sum(c["n_mentions"] for c in clusters + empty_name),
         n_clusters=len(clusters),
+        n_empty_name_clusters=len(empty_name),
         clusters=clusters,
+        empty_name_clusters=empty_name,
     )
 
 
@@ -806,7 +995,7 @@ def doc_record(doc_id: str, dcs: list[dict]) -> dict:
 def build_report(global_resolved: dict, cfg: ClusteringConfig, top: int = 50) -> dict:
     """Cluster counts, cue coverage and the decisions of each step (samples)."""
     per_type, cov, loose = Counter(), Counter(), []
-    clustered_set = set(cfg.clustered_types)
+    clustered_set = cfg.string_similarity_types
     for key, by_type in global_resolved.items():
         for etype, b in by_type.items():
             per_type[etype] += 1
@@ -820,9 +1009,9 @@ def build_report(global_resolved: dict, cfg: ClusteringConfig, top: int = 50) ->
             if len(names) >= 2:
                 sims = process.cdist(names, names, scorer=fuzz.ratio, dtype=np.float32) / 100.0
                 m = float(sims.min())
-                if m < cfg.threshold - 0.15:
+                if m < cfg.stage2_threshold(etype) - 0.15:
                     loose.append(dict(key=key, type=etype, min_similarity=round(m, 2), names=names[:12]))
-            if etype == "PERSON":
+            if etype == "Person":
                 for ms in b["documents"].values():
                     for m_ in ms:
                         cov["person_mentions"] += 1
@@ -838,6 +1027,7 @@ def build_report(global_resolved: dict, cfg: ClusteringConfig, top: int = 50) ->
         person_cue_coverage=dict(cov),
         nationality_splits=DIAG["nationality_splits"][:top],
         doc_nationality_conflicts=DIAG["doc_nationality_conflicts"][:top],
+        empty_name_singletons=DIAG["empty_name_singletons"][:top],
         containment_merges=len(DIAG["containment_merges"]),
         containment_merge_examples=DIAG["containment_merges"][:top],
         ambiguous_containment_examples=DIAG["ambiguous_containment"][:top],
@@ -845,5 +1035,7 @@ def build_report(global_resolved: dict, cfg: ClusteringConfig, top: int = 50) ->
         ambiguous_link_examples=DIAG["ambiguous_links_dropped"][:top],
         blocked_merges=len(DIAG["blocked_merges"]),
         blocked_merge_examples=DIAG["blocked_merges"][:top],
+        token_guard_blocks=len(DIAG["token_guard_blocks"]),
+        token_guard_examples=DIAG["token_guard_blocks"][:top],
         loosely_similar_clusters=loose[:top],
     )

@@ -10,7 +10,7 @@ nationality cue.
 """
 import re
 
-from ..clustering.cues import (  # noqa: F401  (re-exports)
+from ...archive.old.clustering.cues import (  # noqa: F401  (re-exports)
     NAT_GROUPS,
     SEARCH_KINDS,
     TITLES,
