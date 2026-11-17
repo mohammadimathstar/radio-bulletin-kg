@@ -22,7 +22,7 @@ kept, so a mention can never normalize to an empty key by title removal.
 import re
 import unicodedata
 
-from .cues import TITLES
+from ..utils.cues import TITLES
 
 # Particles that may precede a title at the head of a name ("den heer COLIJN").
 _HEAD_PARTICLES = ("van", "de", "der", "den", "von", "di", "du", "le", "la", "el",

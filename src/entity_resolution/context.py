@@ -60,7 +60,7 @@ from bisect import bisect_right
 
 from rapidfuzz import fuzz
 
-from .cues import mention_cues, cues_from_mention
+from ..utils.cues import mention_cues, cues_from_mention
 from .entity_types import canonical_type
 
 # Whitespace -> " " one character for one character: offsets stay valid.

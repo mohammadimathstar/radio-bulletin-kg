@@ -24,7 +24,7 @@ from .entity_types import (
     STRATEGY_STRING_SIMILARITY, STRATEGY_EXACT_EVENT_ID,
     canonical_type, is_resolved_type,
 )
-from .cues import mention_cues, person_cues, cues_from_mention
+from ..utils.cues import mention_cues, person_cues, cues_from_mention
 from .normalize import normalize_name, norm_ws
 from .context import add_context, get_sentence_splitter, normalize_type, paragraph_spans
 from .config import ClusteringConfig
