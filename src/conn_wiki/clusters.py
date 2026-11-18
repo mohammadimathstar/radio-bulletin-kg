@@ -40,6 +40,10 @@ FIN_RE = re.compile(r"\b\d+\s+\d/\d\b")
 FIN_WORDS = {"sloot", "koers", "hooger", "lager", "staalwaarden", "spoorwegen",
              "beurs", "punt", "punten"}
 
+# OCR line-break hyphenation inside a name: "Dala- dier" (hyphen + space).
+# A real compound ("Jean-Pierre") has NO space after the hyphen and is kept.
+OCR_HYPHEN = re.compile(r"(\w)- +(\w)")
+
 
 # ------------------------------------------------------------------ helpers
 def compact(s: str) -> str:
@@ -113,7 +117,19 @@ def load_clusters(path: str, cue_min_count: int, cue_min_share: float) -> list[d
         for raw_t, body in by_type.items():
             t = TYPE_MAP.get(raw_t, raw_t.upper())
             rep = body.get("representative", key)   # representative is the name; key the unique id
-            forms = Counter({clean(f): n for f, n in body["surface_forms"].items()} or {clean(rep): 1})
+            forms = Counter()
+            for f, n in body["surface_forms"].items():
+                v = clean(f)
+                # PERSON names: a hyphen followed by a space is a scan line-break,
+                # the parts are ONE name ("Dala- dier" -> "Daladier").  The joined
+                # variant is added BEFORE the broken form, so it wins the compact()
+                # dedup in retrieve.query_forms (searching the broken spelling is
+                # pointless).  Without the space ("Jean-Pierre") the hyphen is real.
+                if t == "PERSON" and OCR_HYPHEN.search(v):
+                    forms[OCR_HYPHEN.sub(r"\1\2", v)] += n
+                forms[v] += n
+            if not forms:
+                forms[clean(rep)] += 1
             forms.pop("", None)
             if not forms:                           # degenerate name ("—", OCR junk): not linkable
                 skipped += 1
@@ -127,6 +143,14 @@ def load_clusters(path: str, cue_min_count: int, cue_min_share: float) -> list[d
                                          text=" ".join((m.get("text") or "").split()),
                                          sentence=sent, context=m.get("context") or "",
                                          has_ctx=bool(sent)))
+                    # the IE stage already normalizes OCR names ("Dala- dier" ->
+                    # "Daladier"); that form is the best search query there is
+                    norm = " ".join((m.get("normalized_name") or "").split())
+                    if norm:
+                        v = clean(norm)
+                        if OCR_HYPHEN.search(v):
+                            forms[OCR_HYPHEN.sub(r"\1\2", v)] += 1
+                        forms[v] += 1
             titles_raw = nat_raw = Counter()
             if t == "PERSON":
                 titles_raw = Counter({k: v for k, v in

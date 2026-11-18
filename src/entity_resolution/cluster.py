@@ -445,7 +445,8 @@ def contained(short: str, long: str, thr: float, anchor_last: bool = True) -> bo
     if len(ts) == len(tl) and not any(len(t) == 1 and len(u) > 1 for t, u in zip(ts, tl)):
         return False
     if anchor_last:
-        if len(ts[-1]) < 3 or not tokens_match(ts[-1], tl[-1], thr):
+        if len(ts[-1]) < 3 or not tokens_match(ts[-1], tl[-1], thr) \
+                or fuzz.ratio(ts[-1], tl[-1]) / 100.0 < thr:
             return False
         ts, tl = ts[:-1], tl[:-1]
     j = 0
