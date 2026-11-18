@@ -5,10 +5,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "dotenv>=0.9.9",
     "numpy>=2.5.4",
     "pip>=26.3",
     "rapidfuzz>=3.14.6",
     "scikit-learn>=1.9.1",
     "sentence-transformers>=6.3.0",
     "spacy>=3.8.18",
+    "typesafe-sdk>=0.7.5",
+]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
 ]

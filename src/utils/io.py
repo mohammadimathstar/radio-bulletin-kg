@@ -283,3 +283,27 @@ def write_jsonl(records: list, path: str) -> None:
     with open(p, "w", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+
+
+def read_jsonl(path: str) -> list[dict]:
+    """Read a JSONL file; a truncated last line (crash mid-write) is ignored."""
+    p, out = Path(path), []
+    if not p.exists():
+        return out
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
+def append_jsonl(fh, obj: dict) -> None:
+    """Write one JSON line and flush so the file can be read while the script runs."""
+    fh.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+    fh.flush()
+
+

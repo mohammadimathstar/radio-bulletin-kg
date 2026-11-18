@@ -54,7 +54,7 @@ from .decide import decide, total  # noqa: E402
 from .features import ALLOWED_CLASSES, COUNTRY_CLASSES, RELATION_PROPS, Embedder, Scorer  # noqa: E402
 from .retrieve import Retriever  # noqa: E402
 from .wikidata import WDClient, claim_ids  # noqa: E402
-from .io import append_jsonl, read_jsonl, write_jsonl  # noqa: E402
+from src.utils.io import append_jsonl, read_jsonl, write_jsonl  # noqa: E402
 
 
 class Linker:
