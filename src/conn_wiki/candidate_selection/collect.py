@@ -25,13 +25,17 @@ Per entity:
   4. link / nil / uncertain via judge(), append the line.
 
 Every cluster NOT judged is counted with its reason in the printed summary
-(already_done, no_link, status_skip, no_candidates, other_type, no_gold,
-no_usable_mention, error), so an empty run always says WHY.  A missing or
-empty documents file, or an empty links file, raises SystemExit.  The
-documents/links join tries the exact cluster id first, then a normalized
-id (case/whitespace/type-casing: 'Spanje||Place' == 'spanje||PLACE',
-counted as norm_join) — see candidate_judge/diagnose_join.py to inspect
-exactly how the two files' ids differ.
+(already_done, norm_join, no_link, status_skip, no_candidates, other_type,
+no_gold, no_usable_mention, error), so an empty run always says WHY.  The
+entity-type filter is applied FIRST — via the links record's type when there
+is one, else the document cluster's own type — so no_link / status_skip /
+no_candidates describe only the judgable types (default PERSON, ORGANIZATION,
+PLACE, VEHICLE) and other_type catches everything else (events, legal
+documents, ...).  A missing or empty documents file, or an empty links file,
+raises SystemExit.  The documents/links join tries the exact cluster id
+first, then a normalized id (case/whitespace/type-casing: 'Spanje||Place' ==
+'spanje||PLACE', counted as norm_join) — see candidate_judge/diagnose_join.py
+to inspect exactly how the two files' ids differ.
 """
 import json
 import re
@@ -190,17 +194,24 @@ def main(build, send, name: str, errors=(RuntimeError, OSError, ValueError)) -> 
                 link = norm.get(_join_key(gid))     # same id modulo case/whitespace/type casing
                 if link:
                     stats["norm_join"] += 1
+            # the entity-type filter FIRST: the links record's type when there is
+            # one (what the extraction gated on, e.g. EVENT -> LEGAL_DOCUMENT),
+            # else the document cluster's own type.  Clusters outside the filter —
+            # with the default types typically events/legal documents — never
+            # reach the join-sensitive counters, so no_link / status_skip /
+            # no_candidates describe only the judgable types and no_link stays a
+            # pure documents-vs-links signal.
+            if entity_types and normalize_type((link or {}).get("type") or cluster.get("type")) not in entity_types:
+                stats["other_type"] += 1
+                continue
             if not link:
-                stats["no_link"] += 1                                     # documents vs links mismatch
+                stats["no_link"] += 1                             # judgable type, but no links record
                 continue
             if _field(link, "status") not in statuses:
                 stats["status_skip"] += 1                                 # e.g. already accepted
                 continue
             if not link.get("candidates"):
                 stats["no_candidates"] += 1
-                continue
-            if entity_types and normalize_type(link.get("type") or cluster.get("type")) not in entity_types:
-                stats["other_type"] += 1                  # only clusters that would be judged reach this
                 continue
             spans = [(doc_id, m["start"], m["end"]) for m in cluster["mentions"] if m.get("start") is not None]
             if gold is not None and not any(s in gold for s in spans):
