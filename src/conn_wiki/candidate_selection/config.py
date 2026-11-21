@@ -21,7 +21,7 @@ class Config:
         default="./data/interim/document_clusters.jsonl",
         metadata=dict(help="resolved documents of the IE step (input; one line per document)"))
     links_path: str = field(
-        default="./data/output/links/wikidata_pass1.jsonl",
+        default="./data/output/links/wikidata_links.jsonl",
         metadata=dict(help="links file of candidate extraction (input): the final file, or "
                            "wikidata_pass1.jsonl (both record shapes are accepted)"))
     profiles_path: str = field(

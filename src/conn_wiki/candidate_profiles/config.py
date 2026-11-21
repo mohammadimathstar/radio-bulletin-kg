@@ -15,7 +15,7 @@ from pathlib import Path
 @dataclass
 class Config:
     # ---- input / output ----
-    final_path: str = field(default="./data/output/links/wikidata_pass1.jsonl", #wikidata_links.jsonl",
+    final_path: str = field(default="./data/output/links/wikidata_links.jsonl",
                             metadata=dict(help="links file of candidate extraction (input)"))
     out_path: str = field(default="./data/output/links/candidate_profiles.jsonl",
                           metadata=dict(help="profiles output, one JSONL line per candidate (appended, resumable)"))

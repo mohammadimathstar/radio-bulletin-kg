@@ -43,8 +43,8 @@ class LinkingConfig:
     # ---- languages / concurrency ----
     langs: tuple = ("en", "nl", "de", "fr")      # languages fetched for labels/aliases/descriptions
     search_langs: tuple = ("nl", "en")           # wbsearchentities languages per query form
-    workers: int = 6             # clusters processed concurrently (each fans out searches to queries_workers)
-    queries_workers: int = 12    # concurrent search requests shared by all clusters
+    workers: int = 12             # clusters processed concurrently (each fans out searches to queries_workers)
+    queries_workers: int = 24    # concurrent search requests shared by all clusters
     cluster_retries: int = 3     # in-run retries per cluster on network/API errors before [skip]
     retry_backoff: float = 5.0   # base seconds between cluster retries (multiplied by attempt)
 

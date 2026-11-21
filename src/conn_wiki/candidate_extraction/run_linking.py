@@ -192,6 +192,22 @@ class Linker:
         Consistency: one QID used by several clusters is flagged (type_conflict
         if the types differ -> accepted is demoted to review, else
         possible_duplicate_clusters).
+
+        Faster than the first version, which fetched the entities of every
+        cluster separately inside a sequential loop (30+ minutes on big
+        corpora, no progress output):
+          - every unique QID (siblings + candidates) is fetched exactly ONCE,
+            in batches of 50 — siblings repeat across documents, candidates
+            repeat across clusters, and high-degree clusters (places, people
+            that occur in hundreds of bulletins) had sibling sets of thousands;
+          - the claims are parsed once into a {qid: {prop: ids}} table; the
+            per-cluster loop afterwards is pure set operations;
+          - a failing batch no longer aborts the whole run after half an hour
+            (one retry, then the affected QIDs simply get no coherence);
+          - progress is printed while it works.
+        The sibling sets are precomputed per document from the PASS-1 statuses
+        — identical semantics, because `results` was only updated after the
+        loop anyway.
         """
         cfg = self.cfg
         clusters = [c for c in clusters if c["id"] in records]
@@ -203,26 +219,70 @@ class Linker:
         results = {c["id"]: records[c["id"]]["result"] for c in clusters}
         cands = {c["id"]: records[c["id"]]["candidates"] for c in clusters}
 
-        new_results = {}
+        doc_acc = {}                                  # doc -> {cluster_id: accepted qid}
+        for d, ids in by_doc.items():
+            acc = {s: results[s]["qid"] for s in ids
+                   if results[s]["status"] == "accepted" and results[s]["qid"]}
+            if acc:
+                doc_acc[d] = acc
+        sibs_of = {}
         for c in clusters:
+            sibs_of[c["id"]] = {q for d in c["docs"] if d in doc_acc
+                                for s, q in doc_acc[d].items() if s != c["id"]}
+
+        need = set()
+        for c in clusters:
+            if cands[c["id"]]:
+                need |= sibs_of[c["id"]] | {x["qid"] for x in cands[c["id"]]}
+        claims: dict[str, dict] = {}                  # qid -> {RELATION_PROPS prop: set of claim ids}
+        todo = sorted(need)
+        t0 = time.monotonic()
+        print(f"pass 2: {len(clusters)} clusters, {len(todo)} unique qids for the coherence "
+              f"({-(-len(todo) // 50)} batches of 50)", flush=True)
+        for i in range(0, len(todo), 50):
+            batch = todo[i:i + 50]
+            ents = {}
+            for attempt in range(2):
+                try:
+                    ents = self.wd.entities(batch, claims=True)
+                    break
+                except Exception as ex:               # noqa: BLE001 — one bad batch must not kill the run
+                    if attempt:
+                        print(f"[skip] pass 2 qids {batch[0]}..: {ex!r} (no coherence for them)",
+                              flush=True)
+                    else:
+                        time.sleep(2)
+            for q in batch:
+                e = ents.get(q)
+                claims[q] = {p: set(claim_ids(e, p)) for p in RELATION_PROPS} if e else {}
+            for q, e in ents.items():                 # extras the client returned (e.g. redirect targets)
+                if q not in claims:
+                    claims[q] = {p: set(claim_ids(e, p)) for p in RELATION_PROPS}
+            if (i // 50) % 20 == 19:
+                print(f"  pass 2: fetched {min(i + 50, len(todo))}/{len(todo)} qids "
+                      f"({time.monotonic() - t0:.0f}s)", flush=True)
+        print(f"  pass 2: claims ready ({time.monotonic() - t0:.0f}s)", flush=True)
+
+        new_results = {}
+        for n, c in enumerate(clusters, 1):
             cs = cands[c["id"]]
             if not cs:
                 continue
-            sibs = {results[s]["qid"] for d in c["docs"] for s in by_doc[d]
-                    if s != c["id"] and results[s]["status"] == "accepted"}
+            sibs = sibs_of[c["id"]]
             if not sibs:
                 continue
-            sib_ents = self.wd.entities(list(sibs), claims=True)
             sib_rel = set()
-            for e in sib_ents.values():
-                for p in RELATION_PROPS:
-                    sib_rel |= set(claim_ids(e, p))
-            ents = self.wd.entities([x["qid"] for x in cs], claims=True)
+            for s in sibs:
+                for vals in claims.get(s, {}).values():
+                    sib_rel |= vals
             for cand in cs:
-                e = ents.get(cand["qid"], {})
-                rel = {x for p in RELATION_PROPS for x in claim_ids(e, p)}
+                rel = set()
+                for vals in claims.get(cand["qid"], {}).values():
+                    rel |= vals
                 cand["feats"]["coherence"] = min((len(rel & sibs) + len(rel & sib_rel)) / 3, 1.0)
             new_results[c["id"]] = decide(c, cs, cfg)
+            if n % 50 == 0:
+                print(f"  pass 2: re-decided {n}/{len(clusters)} clusters", flush=True)
         results.update(new_results)               # after the loop: siblings use pass-1 status
 
         by_qid = defaultdict(list)

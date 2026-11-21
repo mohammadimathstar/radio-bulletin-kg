@@ -285,6 +285,12 @@ def write_jsonl(records: list, path: str) -> None:
             f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
 
 
+def append_jsonl(fh, obj: dict) -> None:
+    """Write one JSON line and flush so the file can be read while the script runs."""
+    fh.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+    fh.flush()
+
+
 def read_jsonl(path: str) -> list[dict]:
     """Read a JSONL file; a truncated last line (crash mid-write) is ignored."""
     p, out = Path(path), []
@@ -301,9 +307,14 @@ def read_jsonl(path: str) -> list[dict]:
     return out
 
 
-def append_jsonl(fh, obj: dict) -> None:
-    """Write one JSON line and flush so the file can be read while the script runs."""
-    fh.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
-    fh.flush()
-
-
+def select_docs(docs, doc_ids=None, gold=None, limit=None):
+    """Documents to process: only `doc_ids`, only documents with gold annotations, and at most `limit` of them."""
+    gold_docs = {d for d, _, _ in gold} if gold else None
+    n = 0
+    for doc in docs:
+        if (doc_ids and doc["doc_id"] not in doc_ids) or (gold_docs is not None and doc["doc_id"] not in gold_docs):
+            continue
+        if limit and n >= limit:
+            return
+        n += 1
+        yield doc
